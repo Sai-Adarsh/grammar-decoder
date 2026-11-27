@@ -129,7 +129,7 @@ fn tokenizer() -> Value {
 }
 
 #[test]
-fn real_sized_bytelevel_fixture_compares_individual_and_trie_masks() {
+fn real_sized_bytelevel_fixture_compares_all_three_masks() {
     let work = Work::new();
     let path = work.write("tokens.json", serde_json::to_vec(&tokenizer()).unwrap());
     let out = cli(&["--mask-bench", path.to_str().unwrap()], b"");
@@ -141,8 +141,21 @@ fn real_sized_bytelevel_fixture_compares_individual_and_trie_masks() {
     let csv = String::from_utf8(out.stdout).unwrap();
     assert_eq!(csv.lines().count(), 6);
     assert!(csv.contains("case,vocabulary,allowed,individual_bytes,trie_bytes,"));
+    assert!(csv.contains(",projected_bytes,trie_median_ns,projected_median_ns"));
     assert!(csv.contains("query_text,50257,"));
     assert!(csv.contains("complete,50257,1,"));
+    let reductions: Vec<_> = csv
+        .lines()
+        .skip(1)
+        .map(|row| {
+            let columns: Vec<_> = row.split(',').collect();
+            let raw = columns[4].parse::<usize>().unwrap();
+            let projected = columns[7].parse::<usize>().unwrap();
+            raw.checked_sub(projected)
+                .expect("projection cannot add transitions")
+        })
+        .collect();
+    assert!(reductions.into_iter().any(|reduction| reduction > 0));
 }
 
 #[test]
