@@ -19,6 +19,8 @@ jobs:
           persist-credentials: false
       - name: Test the locked dependency set
         run: cargo +stable test --locked
+      - name: Build the locked release binary
+        run: cargo +stable build --locked --release
 
   native:
     name: Native llama.cpp tests
@@ -60,6 +62,8 @@ jobs:
             echo "LD_LIBRARY_PATH=$lib_dir"
             echo "GRAMMAR_TEST_MODEL=$RUNNER_TEMP/stories15M.gguf"
           } >> "$GITHUB_ENV"
+      - name: Build the locked native release binary
+        run: cargo +1.87.0 build --locked --release --features native-llama
       - name: Run the native test suite
         run: cargo +1.87.0 test --locked --release --features native-llama
       - name: Generate and validate JSON with TinyStories
