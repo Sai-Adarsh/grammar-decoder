@@ -25,6 +25,12 @@ impl Backend {
         // The benchmark owns the native backend for the lifetime of all model objects.
         unsafe {
             ffi::llama_log_set(Some(log_errors), ptr::null_mut());
+            if ffi::ggml_backend_dev_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU).is_null() {
+                // Portable releases ship CPU plugins alongside libllama, away from our executable.
+                let library_dir = CString::new(env!("GRAMMAR_LLAMA_LIB_DIR"))
+                    .expect("the native library directory cannot contain NUL");
+                ffi::ggml_backend_load_all_from_path(library_dir.as_ptr());
+            }
             ffi::llama_backend_init();
         }
         Self
