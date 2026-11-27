@@ -16,6 +16,8 @@ fn grammar_rejects_incomplete_or_invalid_production_sets() {
         (0, vec![], "no rules"),
         (0, vec![(usize::MAX, vec![])], "invalid rule id"),
         (0, vec![(usize::MAX - 1, vec![])], "invalid rule id"),
+        (0, vec![(usize::MAX - 2, vec![])], "rule ids must be contiguous"),
+        (0, vec![(0, vec![]), (3, vec![])], "rule ids must be contiguous"),
         (2, vec![(0, vec![])], "start rule has no productions"),
         (0, vec![(0, vec![Symbol::Rule(3)])], "undefined rule"),
         (
@@ -364,6 +366,44 @@ fn sampler_returns_a_legal_token_when_upper_endpoint_rounding_exhausts_the_weigh
     .unwrap();
     assert_eq!(output.token_ids, [0]);
     assert_eq!(output.bytes, b"a");
+}
+
+#[test]
+fn sampler_preserves_weight_when_extreme_finite_logits_overflow_the_difference() {
+    struct ExtremeScores(bool);
+
+    impl LogitSource for ExtremeScores {
+        fn logits(&mut self, output: &mut [f64]) {
+            if self.0 {
+                output[2] = 0.0;
+            } else {
+                output[..2].copy_from_slice(&[-f64::MAX, f64::MAX]);
+            }
+        }
+
+        fn accept(&mut self, _: usize) {
+            self.0 = true;
+        }
+    }
+
+    let grammar = Grammar::new(
+        0,
+        vec![(0, vec![Symbol::Byte(ByteSet::ranges(&[(b'a', b'b')]))])],
+    )
+    .unwrap();
+    let tokens = [vec![b'a'], vec![b'b'], vec![]];
+    let output = decode(
+        &grammar,
+        &tokens,
+        &mut ExtremeScores(false),
+        DecodeOptions {
+            // The first draw is about 0.033, below the first token's weight share.
+            seed: 10,
+            ..options(2, 1, f64::MAX)
+        },
+    )
+    .unwrap();
+    assert_eq!(output.token_ids, [0]);
 }
 
 #[test]
