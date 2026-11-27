@@ -211,6 +211,8 @@ fn native_model_emits_independently_validated_json_and_full_logit_rows() {
         row["columns_per_logit_row"] == 32_000
             && row["nonfinite_logits"] == 0
             && row["logit_rows"].as_u64().unwrap() == row["generated_tokens"].as_u64().unwrap() + 1
+            && row["eos_at_budget"]
+                == Value::Bool(row["status"] == "eos" && row["generated_tokens"] == 48)
     }));
     let constrained: Vec<_> = rows[1..]
         .iter()
