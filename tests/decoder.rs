@@ -122,6 +122,111 @@ fn recursive_completions_restore_all_parent_alternatives_after_masking() {
     assert!(parser.accepting());
 }
 
+#[test]
+fn equivalent_prefixes_share_chart_transitions_without_merging_token_ids() {
+    let grammar = Grammar::new(
+        0,
+        vec![(
+            0,
+            vec![
+                Symbol::Byte(ByteSet::ranges(&[(b'a', b'b'), (b'x', b'y')])),
+                Symbol::Byte(ByteSet::ranges(&[(b'x', b'y')])),
+            ],
+        )],
+    )
+    .unwrap();
+    let tokens = [
+        b"a".as_slice(),
+        b"b",
+        b"x",
+        b"y",
+        b"ax",
+        b"by",
+        b"aa",
+        b"bb",
+        b"by",
+        b"",
+    ]
+    .map(<[u8]>::to_vec);
+    let ordinary = Vocabulary::new(&tokens, 9).unwrap();
+    let projected = Vocabulary::for_grammar(&tokens, 9, &grammar).unwrap();
+    assert_eq!(ordinary.trie_nodes(), 9);
+    assert_eq!(projected.trie_nodes(), 5);
+
+    let mut parser = Parser::new(&grammar);
+    let mut mask = [false; 10];
+    let expected = [
+        true, true, true, true, true, true, false, false, true, false,
+    ];
+    assert_eq!(ordinary.mask(&mut parser, &mut mask, MaskMethod::Trie), 8);
+    assert_eq!(mask, expected);
+    assert_eq!(projected.mask(&mut parser, &mut mask, MaskMethod::Trie), 4);
+    assert_eq!(mask, expected);
+    assert!(parser.commit(b"b"));
+    projected.mask(&mut parser, &mut mask, MaskMethod::Trie);
+    assert_eq!(
+        mask,
+        [false, false, true, true, false, false, false, false, false, false]
+    );
+    assert!(parser.commit(b"y"));
+    projected.mask(&mut parser, &mut mask, MaskMethod::Trie);
+    assert_eq!(
+        mask,
+        [false, false, false, false, false, false, false, false, false, true]
+    );
+}
+
+#[test]
+fn prepared_trie_handles_split_utf8_and_foreign_grammars() {
+    let string = compile(&json!({"type":"string"})).unwrap();
+    let literal = compile(&json!({"const":"café"})).unwrap();
+    let tokens = [
+        b"\xa9".as_slice(),
+        b"\xbf",
+        b"\xa9\"",
+        b"\xbf\"",
+        b"\xc2",
+        b"\"",
+        b"",
+    ]
+    .map(<[u8]>::to_vec);
+    let projected = Vocabulary::for_grammar(&tokens, 6, &string).unwrap();
+    let mut mask = [false; 7];
+    for (grammar, expected) in [
+        (&string, [true, true, true, true, false, false, false]),
+        (&literal, [true, false, true, false, false, false, false]),
+    ] {
+        let mut parser = Parser::new(grammar);
+        assert!(parser.commit(b"\"caf\xc3"));
+        projected.mask(&mut parser, &mut mask, MaskMethod::Trie);
+        assert_eq!(mask, expected);
+        assert!(parser.commit(b"\xa9\""));
+        assert!(parser.accepting());
+    }
+}
+
+#[test]
+fn distinct_terminals_preserve_all_256_byte_edges() {
+    let bytes = 0..=u8::MAX;
+    let grammar = Grammar::new(
+        0,
+        bytes.clone().map(|byte| (0, vec![byte.into()])).collect(),
+    )
+    .unwrap();
+    let mut tokens: Vec<_> = bytes.map(|byte| vec![byte]).collect();
+    tokens.push(vec![]);
+    let projected = Vocabulary::for_grammar(&tokens, 256, &grammar).unwrap();
+    assert_eq!(projected.trie_nodes(), 257);
+    let mut parser = Parser::new(&grammar);
+    let mut mask = [false; 257];
+    assert_eq!(
+        projected.mask(&mut parser, &mut mask, MaskMethod::Trie),
+        256
+    );
+    assert!(mask[..256].iter().all(|allowed| *allowed));
+    assert!(!mask[256]);
+}
+
 struct Scores {
     step: usize,
     dense: bool,
@@ -157,7 +262,7 @@ fn decoder_runs_dense_and_sparse_paths_without_emitting_illegal_tokens() {
     let grammar = compile(&json!({"const":"ok"})).unwrap();
     let mut tokens = vec![br#""ok""#.to_vec(), Vec::new(), b"bad".to_vec(), Vec::new()];
     tokens.extend((0..128).map(|index| format!("bad{index}").into_bytes()));
-    let vocabulary = Vocabulary::new(&tokens, 3).unwrap();
+    let vocabulary = Vocabulary::for_grammar(&tokens, 3, &grammar).unwrap();
     for (dense, temperature) in [(true, 0.2), (false, 0.0)] {
         let mut source = Scores {
             dense,

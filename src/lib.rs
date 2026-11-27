@@ -2,8 +2,9 @@ pub mod json_schema;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
 
-#[derive(Clone)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ByteSet([u64; 4]);
 
 impl ByteSet {
@@ -42,6 +43,7 @@ pub struct Grammar {
     productions: Vec<(usize, Vec<Symbol>)>,
     by_lhs: Vec<Vec<usize>>,
     nullable: Vec<bool>,
+    byte_representatives: OnceLock<[u8; 256]>,
 }
 
 impl Grammar {
@@ -91,8 +93,41 @@ impl Grammar {
             return Err("rule ids must be contiguous and all rules must derive terminal bytes");
         }
         let nullable = fixed_point(true);
-        Ok(Self { productions, by_lhs, nullable })
+        Ok(Self { productions, by_lhs, nullable, byte_representatives: OnceLock::new() })
     }
+
+    fn byte_representatives(&self) -> &[u8; 256] {
+        self.byte_representatives.get_or_init(|| {
+            byte_representatives(
+                self.productions.iter().flat_map(|(_, rhs)| rhs).filter_map(|symbol| match symbol {
+                    Symbol::Byte(set) => Some(set),
+                    Symbol::Rule(_) => None,
+                }),
+            )
+        })
+    }
+}
+
+fn byte_representatives<'a>(sets: impl Iterator<Item = &'a ByteSet>) -> [u8; 256] {
+    let mut representatives = [0; 256];
+    let mut seen = HashSet::new();
+    for set in sets.filter(|&set| seen.insert(set)) {
+        // Refine each existing class by membership in this terminal. The
+        // smallest byte in each class is its actual scanner input.
+        let mut first = [None; 512];
+        let mut classes = 0;
+        for (byte, representative) in (0..=u8::MAX).zip(&mut representatives) {
+            let part = usize::from(*representative) * 2 + usize::from(set.contains(byte));
+            *representative = *first[part].get_or_insert_with(|| {
+                classes += 1;
+                byte
+            });
+        }
+        if classes == 256 {
+            break;
+        }
+    }
+    representatives
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -262,18 +297,38 @@ struct TrieNode {
     token_ids: Vec<usize>,
 }
 
-/// An immutable byte trie reusable across requests with the same token vocabulary.
+/// An immutable vocabulary trie reusable across requests.
 pub struct Vocabulary<'tokens> {
     tokens: &'tokens [Vec<u8>],
     eos: usize,
     nodes: Vec<TrieNode>,
+    byte_representatives: Option<[u8; 256]>,
 }
 
 impl<'tokens> Vocabulary<'tokens> {
     pub fn new(tokens: &'tokens [Vec<u8>], eos: usize) -> Result<Self, DecodeError> {
+        Self::build(tokens, eos, None)
+    }
+
+    /// Build a trie that shares transitions for bytes indistinguishable by the grammar.
+    pub fn for_grammar(
+        tokens: &'tokens [Vec<u8>],
+        eos: usize,
+        grammar: &Grammar,
+    ) -> Result<Self, DecodeError> {
+        Self::build(tokens, eos, Some(*grammar.byte_representatives()))
+    }
+
+    fn build(
+        tokens: &'tokens [Vec<u8>],
+        eos: usize,
+        byte_representatives: Option<[u8; 256]>,
+    ) -> Result<Self, DecodeError> {
         if eos >= tokens.len() {
             return Err(DecodeError::InvalidConfig);
         }
+        let identity = std::array::from_fn(|byte| byte as u8);
+        let alphabet = byte_representatives.as_ref().unwrap_or(&identity);
         let mut nodes = vec![TrieNode::default()];
         for (id, token) in tokens.iter().enumerate() {
             if id == eos || token.is_empty() {
@@ -281,6 +336,7 @@ impl<'tokens> Vocabulary<'tokens> {
             }
             let mut parent = 0;
             for &byte in token {
+                let byte = alphabet[usize::from(byte)];
                 parent = match nodes[parent].edges.iter().find(|edge| edge.0 == byte) {
                     Some(&(_, child)) => child,
                     None => {
@@ -293,7 +349,7 @@ impl<'tokens> Vocabulary<'tokens> {
             }
             nodes[parent].token_ids.push(id);
         }
-        Ok(Self { tokens, eos, nodes })
+        Ok(Self { tokens, eos, nodes, byte_representatives })
     }
 
     pub fn trie_nodes(&self) -> usize {
@@ -301,10 +357,18 @@ impl<'tokens> Vocabulary<'tokens> {
     }
 
     /// Fill a dense mask and return the number of attempted parser byte transitions.
-    /// Use the individual path as a reference when measuring the two algorithms.
+    /// The individual path checks original bytes and also serves as a fallback when
+    /// a prepared trie is used with a grammar whose byte partition differs.
     pub fn mask(&self, parser: &mut Parser<'_>, allowed: &mut [bool], method: MaskMethod) -> usize {
         assert_eq!(allowed.len(), self.tokens.len());
         allowed.fill(false);
+        let method = match method {
+            MaskMethod::Trie if self.byte_representatives
+                .as_ref()
+                .is_some_and(|alphabet| alphabet != parser.grammar.byte_representatives()) =>
+                MaskMethod::Individual,
+            other => other,
+        };
         let mut attempted = 0;
         match method {
             MaskMethod::Individual => {
@@ -394,7 +458,12 @@ pub fn decode(
     source: &mut impl LogitSource,
     options: DecodeOptions,
 ) -> Result<Generation, DecodeError> {
-    decode_with_vocabulary(grammar, &Vocabulary::new(vocabulary, options.eos)?, source, options)
+    decode_with_vocabulary(
+        grammar,
+        &Vocabulary::for_grammar(vocabulary, options.eos, grammar)?,
+        source,
+        options,
+    )
 }
 
 pub fn decode_with_vocabulary(
