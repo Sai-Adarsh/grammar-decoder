@@ -54,6 +54,12 @@ impl Grammar {
         if start > max_lhs {
             return Err("start rule has no productions");
         }
+        let productive_rules_error =
+            "rule ids must be contiguous and all rules must derive terminal bytes";
+        // Contiguous IDs require at least one production per ID, starting at zero.
+        if max_lhs >= rules.len() {
+            return Err(productive_rules_error);
+        }
 
         let mut productions = vec![(augmented, vec![Symbol::Rule(start)])];
         productions.extend(rules);
@@ -90,7 +96,7 @@ impl Grammar {
             }
         };
         if fixed_point(false).iter().any(|valid| !valid) {
-            return Err("rule ids must be contiguous and all rules must derive terminal bytes");
+            return Err(productive_rules_error);
         }
         let nullable = fixed_point(true);
         Ok(Self { productions, by_lhs, nullable, byte_representatives: OnceLock::new() })
@@ -533,7 +539,16 @@ fn sample(candidates: &[(usize, f64)], temperature: f64, rng: &mut u64) -> Optio
     if temperature == 0.0 {
         return Some(best);
     }
-    let weight = |score: f64| ((score - maximum) / temperature).exp();
+    let weight = |score: f64| {
+        let difference = score - maximum;
+        let scaled = if difference.is_finite() {
+            difference / temperature
+        } else {
+            // The finite scores have opposite signs. Scale first to avoid overflow.
+            score / temperature - maximum / temperature
+        };
+        scaled.exp()
+    };
     let total: f64 = candidates.iter().map(|&(_, score)| weight(score)).sum();
     *rng = rng.wrapping_add(0x9e3779b97f4a7c15);
     let mut bits = *rng;
