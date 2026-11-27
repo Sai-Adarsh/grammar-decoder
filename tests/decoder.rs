@@ -330,6 +330,52 @@ fn decoder_runs_dense_and_sparse_paths_without_emitting_illegal_tokens() {
 }
 
 #[test]
+fn decoder_can_finish_a_complete_value_at_the_token_cap() {
+    struct BoundaryScores {
+        accepted: Vec<usize>,
+        rows: usize,
+        eos_score: f64,
+    }
+
+    impl LogitSource for BoundaryScores {
+        fn logits(&mut self, output: &mut [f64]) {
+            self.rows += 1;
+            if self.accepted.is_empty() {
+                output[0] = 0.0;
+            } else {
+                output[1] = 100.0;
+                output[2] = self.eos_score;
+            }
+        }
+
+        fn accept(&mut self, token_id: usize) {
+            self.accepted.push(token_id);
+        }
+    }
+
+    let number = compile(&json!({"type":"integer"})).unwrap();
+    let incomplete = compile(&json!({"const":12})).unwrap();
+    let tokens = [b"1".to_vec(), b"2".to_vec(), vec![]];
+    for temperature in [0.0, 1.0] {
+        let mut source = BoundaryScores { accepted: vec![], rows: 0, eos_score: -100.0 };
+        let result = decode(&number, &tokens, &mut source, options(2, 1, temperature)).unwrap();
+        assert_eq!(result.bytes, b"1");
+        assert_eq!(result.token_ids, [0]);
+        assert_eq!(source.accepted, [0]);
+        assert_eq!(source.rows, 2);
+    }
+    for (grammar, eos_score) in [(&incomplete, 0.0), (&number, f64::NEG_INFINITY)] {
+        let mut source = BoundaryScores { accepted: vec![], rows: 0, eos_score };
+        assert!(matches!(
+            decode(grammar, &tokens, &mut source, options(2, 1, 0.0)),
+            Err(DecodeError::MaxTokens)
+        ));
+        assert_eq!(source.accepted, [0]);
+        assert_eq!(source.rows, 2);
+    }
+}
+
+#[test]
 fn sampler_returns_a_legal_token_when_upper_endpoint_rounding_exhausts_the_weights() {
     struct NearEndpoint(bool);
 

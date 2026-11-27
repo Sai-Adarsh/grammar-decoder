@@ -271,6 +271,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn raw_benchmark_uses_the_same_eos_budget_rule() {
+        struct FixedLogits {
+            accepted: Vec<usize>,
+            eos_score: f64,
+        }
+        impl LogitSource for FixedLogits {
+            fn logits(&mut self, output: &mut [f64]) {
+                output.copy_from_slice(&[100.0, self.eos_score]);
+            }
+            fn accept(&mut self, token_id: usize) {
+                self.accepted.push(token_id);
+            }
+        }
+        let tokens = Tokens { pieces: vec![b"1".to_vec(), vec![]], eos: 1 };
+        for (eos_score, expected) in [(-100.0, "eos"), (f64::NEG_INFINITY, "token_budget")] {
+            let mut source = FixedLogits { accepted: vec![], eos_score };
+            assert_eq!(unconstrained(&mut source, &tokens, 1), expected);
+            assert_eq!(source.accepted, [0]);
+        }
+    }
+
+    #[test]
     fn validator_distinguishes_syntax_from_schema_constraints() {
         let schema = json!({"type":"object","properties":{"count":{"type":"integer","enum":[1,2]}},
                          "required":["count"],"additionalProperties":false});
