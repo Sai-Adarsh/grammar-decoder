@@ -28,6 +28,28 @@ The optional root `$schema` must name Draft 2020-12. The compiler accepts `title
 
 Before expanding rules, the compiler caps schemas at 64 nested JSON value levels, 512 values, and 8 KiB of combined UTF-8 key and string bytes. These limits include values in `enum` and `const`. The CLI accepts up to 64 KiB of schema input and 16 KiB of candidate input, counting whitespace.
 
+## Masking with a real vocabulary
+
+The `Vocabulary` index shares byte prefixes across tokens. One traversal advances the Earley chart once per viable trie edge and rolls it back before visiting a sibling. Invalid prefixes skip whole subtrees. Duplicate byte spellings keep each token ID, and EOS is allowed only when the original parser state accepts. Reuse the index across requests with `decode_with_vocabulary`. When finite logits are sparse, the decoder checks only those candidates individually.
+
+Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community/gpt2/blob/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json) at revision `607a30d783dfa663caf39e06633721c8d4cfcd7e` and run:
+
+```sh
+cargo run --locked --release -- --mask-bench /path/to/tokenizer.json
+```
+
+One Apple Silicon run used 50,257 token IDs and a 98,024-node trie. The two masks matched exactly in every state and every trial. Timing is the median of nine alternating passes and excludes index construction, tokenization, and model execution.
+
+| Parser state | Allowed IDs | Individual byte attempts | Trie byte attempts | Individual µs | Trie µs |
+|---|---:|---:|---:|---:|---:|
+| Start | 2 | 50,259 | 259 | 338 | 2 |
+| Action enum | 8 | 52,508 | 354 | 518 | 4 |
+| Query text | 50,032 | 320,705 | 97,929 | 312,983 | 105,414 |
+| Unicode escape | 1 | 50,271 | 264 | 388 | 3 |
+| Complete | 1 | 50,256 | 256 | 382 | 2 |
+
+The free-form string state still visits most of the trie. The measurements show where prefix sharing helps and where additional mask caching or a different parser representation would matter. This benchmark uses a real tokenizer vocabulary with predetermined parser states. The two decoding examples still use fixture logits.
+
 ## Model integration
 
 Implement `LogitSource` for next-token scores and model state updates. Pass a vocabulary indexed by token ID and identify the end-of-sequence token. For tokenizers with context-dependent detokenization, adapt piece-to-byte decoding before passing it to the parser.

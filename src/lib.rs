@@ -204,12 +204,107 @@ impl<'grammar> Parser<'grammar> {
         }
     }
 
-    fn viable(&mut self, bytes: &[u8]) -> bool {
+    fn viable(&mut self, bytes: &[u8], attempted_bytes: &mut usize) -> bool {
         let checkpoint = self.chart.len();
-        let valid = self.commit(bytes);
+        let valid = bytes.iter().all(|byte| {
+            *attempted_bytes += 1;
+            self.scan(*byte)
+        });
         self.chart.truncate(checkpoint);
         valid
     }
+}
+
+#[derive(Default)]
+struct TrieNode {
+    edges: Vec<(u8, usize)>,
+    token_ids: Vec<usize>,
+}
+
+/// An immutable byte trie reusable across requests with the same token vocabulary.
+pub struct Vocabulary<'tokens> {
+    tokens: &'tokens [Vec<u8>],
+    eos: usize,
+    nodes: Vec<TrieNode>,
+}
+
+impl<'tokens> Vocabulary<'tokens> {
+    pub fn new(tokens: &'tokens [Vec<u8>], eos: usize) -> Result<Self, DecodeError> {
+        if eos >= tokens.len() {
+            return Err(DecodeError::InvalidConfig);
+        }
+        let mut nodes = vec![TrieNode::default()];
+        for (id, token) in tokens.iter().enumerate() {
+            if id == eos || token.is_empty() {
+                continue;
+            }
+            let mut parent = 0;
+            for &byte in token {
+                parent = match nodes[parent].edges.iter().find(|edge| edge.0 == byte) {
+                    Some(&(_, child)) => child,
+                    None => {
+                        let child = nodes.len();
+                        nodes.push(TrieNode::default());
+                        nodes[parent].edges.push((byte, child));
+                        child
+                    }
+                };
+            }
+            nodes[parent].token_ids.push(id);
+        }
+        Ok(Self { tokens, eos, nodes })
+    }
+
+    pub fn trie_nodes(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Fill a dense mask and return the number of attempted parser byte transitions.
+    /// Use the individual path as a reference when measuring the two algorithms.
+    pub fn mask(&self, parser: &mut Parser<'_>, allowed: &mut [bool], method: MaskMethod) -> usize {
+        assert_eq!(allowed.len(), self.tokens.len());
+        allowed.fill(false);
+        let mut attempted = 0;
+        match method {
+            MaskMethod::Individual => {
+                for (id, token) in self.tokens.iter().enumerate() {
+                    if id != self.eos && !token.is_empty() {
+                        allowed[id] = parser.viable(token, &mut attempted);
+                    }
+                }
+            }
+            MaskMethod::Trie => {
+                // One parser column per successful edge. Popping an exhausted child
+                // restores its parent so each sibling starts from the same state.
+                let mut stack = vec![(0, 0)];
+                while let Some((node, next_edge)) = stack.last_mut() {
+                    if let Some(&(byte, child)) = self.nodes[*node].edges.get(*next_edge) {
+                        *next_edge += 1;
+                        attempted += 1;
+                        if parser.scan(byte) {
+                            for &id in &self.nodes[child].token_ids {
+                                allowed[id] = true;
+                            }
+                            stack.push((child, 0));
+                        }
+                    } else {
+                        stack.pop();
+                        if !stack.is_empty() {
+                            parser.chart.pop();
+                        }
+                    }
+                }
+            }
+        }
+        allowed[self.eos] = parser.accepting();
+        attempted
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum MaskMethod {
+    Individual,
+    Trie,
 }
 
 pub trait LogitSource {
@@ -250,6 +345,7 @@ pub struct Generation {
     pub bytes: Vec<u8>,
     pub token_ids: Vec<usize>,
     pub rejected_candidates: usize,
+    pub attempted_mask_bytes: usize,
 }
 
 pub fn decode(
@@ -258,27 +354,49 @@ pub fn decode(
     source: &mut impl LogitSource,
     options: DecodeOptions,
 ) -> Result<Generation, DecodeError> {
-    if options.eos >= vocabulary.len() || !options.temperature.is_finite() || options.temperature < 0.0 {
+    decode_with_vocabulary(grammar, &Vocabulary::new(vocabulary, options.eos)?, source, options)
+}
+
+pub fn decode_with_vocabulary(
+    grammar: &Grammar,
+    vocabulary: &Vocabulary<'_>,
+    source: &mut impl LogitSource,
+    options: DecodeOptions,
+) -> Result<Generation, DecodeError> {
+    if options.eos != vocabulary.eos || !options.temperature.is_finite() || options.temperature < 0.0 {
         return Err(DecodeError::InvalidConfig);
     }
 
     let mut parser = Parser::new(grammar);
-    let mut logits = vec![f64::NEG_INFINITY; vocabulary.len()];
+    let mut logits = vec![f64::NEG_INFINITY; vocabulary.tokens.len()];
+    let mut allowed = vec![false; vocabulary.tokens.len()];
     let mut candidates = Vec::new();
-    let mut generation = Generation { bytes: vec![], token_ids: vec![], rejected_candidates: 0 };
+    let mut generation = Generation {
+        bytes: vec![], token_ids: vec![], rejected_candidates: 0, attempted_mask_bytes: 0,
+    };
     let mut rng = options.seed;
     for step in 0..=options.max_tokens {
         candidates.clear();
         logits.fill(f64::NEG_INFINITY);
         source.logits(&mut logits);
-        for (id, (&score, token)) in logits.iter().zip(vocabulary).enumerate() {
+        let finite = logits.iter().filter(|score| score.is_finite()).count();
+        // Pre-filtered logits can be sparse enough that walking the whole trie
+        // costs more than parsing the few candidates independently.
+        let dense = finite > (vocabulary.tokens.len() / 8).max(16);
+        if dense {
+            generation.attempted_mask_bytes += vocabulary.mask(&mut parser, &mut allowed, MaskMethod::Trie);
+        }
+        for (id, &score) in logits.iter().enumerate() {
             if !score.is_finite() {
                 continue;
             }
-            if if id == options.eos {
+            let token = &vocabulary.tokens[id];
+            if if dense {
+                allowed[id]
+            } else if id == options.eos {
                 parser.accepting()
             } else {
-                !token.is_empty() && parser.viable(token)
+                !token.is_empty() && parser.viable(token, &mut generation.attempted_mask_bytes)
             } {
                 candidates.push((id, score));
             } else {
@@ -292,7 +410,7 @@ pub fn decode(
         if step == options.max_tokens {
             return Err(DecodeError::MaxTokens);
         }
-        let bytes = &vocabulary[token_id];
+        let bytes = &vocabulary.tokens[token_id];
         assert!(parser.commit(bytes));
         generation.bytes.extend(bytes);
         generation.token_ids.push(token_id);
