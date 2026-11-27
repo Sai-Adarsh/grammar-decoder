@@ -1,0 +1,14 @@
+[
+  {
+    "id": "park-ball",
+    "prompt": "Story: A girl heard a scary noise at school.\nRecord: {\"setting\":\"school\",\"character\":\"girl\",\"mood\":\"scared\"}\nStory: A boy named Ben ran to the park. He smiled as he played with his ball.\nRecord:"
+  },
+  {
+    "id": "forest-fox",
+    "prompt": "Story: A boy felt sad at the park.\nRecord: {\"setting\":\"park\",\"character\":\"boy\",\"mood\":\"sad\"}\nStory: A fox hid in the forest. The thunder made him shake with fear.\nRecord:"
+  },
+  {
+    "id": "school-friend",
+    "prompt": "Story: A fox laughed at the park.\nRecord: {\"setting\":\"park\",\"character\":\"fox\",\"mood\":\"happy\"}\nStory: A girl cried at school when her best friend moved away.\nRecord:"
+  }
+]

@@ -19,3 +19,50 @@ jobs:
           persist-credentials: false
       - name: Test the locked dependency set
         run: cargo +stable test --locked
+
+  native:
+    name: Native llama.cpp tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out llama.cpp headers from b12810
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ca123ba76311290ec6ab041dd2058fed8d9f03d2
+          path: llama.cpp
+          persist-credentials: false
+      - name: Install Rust 1.87 and libclang
+        run: |
+          rustup toolchain install 1.87.0 --profile minimal
+          sudo apt-get update
+          sudo apt-get install --yes libclang-dev
+      - name: Download and verify the CPU library and model
+        run: |
+          cd "$RUNNER_TEMP"
+          curl --fail --location --retry 3 --output llama.tar.gz \
+            https://github.com/ggml-org/llama.cpp/releases/download/b12810/llama-b12810-bin-ubuntu-x64.tar.gz
+          echo '63b94be37dcc34cb4933554d4f998e9649841b23da7ffc71d1f66d63762464d7  llama.tar.gz' | sha256sum -c -
+          mkdir llama-cpu
+          tar -xzf llama.tar.gz -C llama-cpu
+          llama_lib=$(find "$RUNNER_TEMP/llama-cpu" -name libllama.so -print -quit)
+          test -f "$llama_lib"
+          lib_dir=$(dirname "$llama_lib")
+          curl --fail --location --retry 3 --output stories15M.gguf \
+            https://huggingface.co/ggml-org/models-moved/resolve/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories15M.gguf
+          awk '$2 == "stories15M.gguf"' "$GITHUB_WORKSPACE/evidence/tinystories-native-json.sha256" | sha256sum -c -
+          {
+            echo "LLAMA_SOURCE_DIR=$GITHUB_WORKSPACE/llama.cpp"
+            echo "LLAMA_LIB_DIR=$lib_dir"
+            echo "LD_LIBRARY_PATH=$lib_dir"
+            echo "GRAMMAR_TEST_MODEL=$RUNNER_TEMP/stories15M.gguf"
+          } >> "$GITHUB_ENV"
+      - name: Run the native test suite
+        run: cargo +1.87.0 test --locked --release --features native-llama
+      - name: Generate and validate JSON with TinyStories
+        run: >-
+          cargo +1.87.0 test --locked --release --features native-llama
+          native_model_emits_independently_validated_json_and_full_logit_rows -- --ignored --exact
