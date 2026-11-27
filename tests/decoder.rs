@@ -83,6 +83,45 @@ fn trie_preserves_duplicate_tokens_and_rolls_back_failed_prefixes() {
     assert!(parser.accepting());
 }
 
+#[test]
+fn recursive_completions_restore_all_parent_alternatives_after_masking() {
+    let grammar = Grammar::new(
+        0,
+        vec![
+            (0, vec![Symbol::Rule(1), b'x'.into()]),
+            (0, vec![Symbol::Rule(1), b'y'.into()]),
+            (1, vec![b'a'.into(), Symbol::Rule(1), b'b'.into()]),
+            (1, vec![]),
+        ],
+    )
+    .unwrap();
+    let tokens = [b"a", b"b", b"bx".as_slice(), b"by", b"bz", b"x", b"y", b""].map(<[u8]>::to_vec);
+    let vocabulary = Vocabulary::new(&tokens, 7).unwrap();
+    let mut parser = Parser::new(&grammar);
+    assert!(parser.commit(b"aa"));
+    assert!(!parser.commit(b"bbz"));
+
+    for (prefix, expected) in [
+        (
+            b"".as_slice(),
+            [true, true, false, false, false, false, false, false],
+        ),
+        (b"b", [false, true, true, true, false, false, false, false]),
+        (
+            b"by",
+            [false, false, false, false, false, false, false, true],
+        ),
+    ] {
+        assert!(parser.commit(prefix));
+        for method in [MaskMethod::Trie, MaskMethod::Individual, MaskMethod::Trie] {
+            let mut mask = [false; 8];
+            vocabulary.mask(&mut parser, &mut mask, method);
+            assert_eq!(mask, expected);
+        }
+    }
+    assert!(parser.accepting());
+}
+
 struct Scores {
     step: usize,
     dense: bool,

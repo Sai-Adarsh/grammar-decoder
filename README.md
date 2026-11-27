@@ -38,17 +38,19 @@ Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community
 cargo run --locked --release -- --mask-bench /path/to/tokenizer.json
 ```
 
-One Apple Silicon run used 50,257 token IDs and a 98,024-node trie. The two masks matched exactly in every state and every trial. Timing is the median of nine alternating passes and excludes index construction, tokenization, and model execution.
+Each Earley chart column indexes terminal transitions and the items waiting on a nonterminal. A completion visits only the items that were waiting for that rule at its origin. An invalid byte leaves the chart untouched. The parser retains allocation capacity for up to 64 rolled-back columns, which reduces churn during speculative trie traversal.
 
-| Parser state | Allowed IDs | Individual byte attempts | Trie byte attempts | Individual µs | Trie µs |
+The [Apple M3 Pro measurements](evidence/gpt2-earley-before-after.csv) compare the indexed parser with the previous chart at `e6077bb`, both built in release mode. Each chart ran in five processes after one warmup, with alternating process order and nine alternating mask passes per process. The table takes the median of the five reported process medians. The 50,257 token IDs built a 98,024-node trie. The trie and individual masks matched in every state and trial. Index construction, tokenization, and model execution are outside the timed passes.
+
+| Parser state | Allowed IDs | Individual byte attempts | Trie byte attempts | Individual before → after (µs) | Trie before → after (µs) |
 |---|---:|---:|---:|---:|---:|
-| Start | 2 | 50,259 | 259 | 338 | 2 |
-| Action enum | 8 | 52,508 | 354 | 518 | 4 |
-| Query text | 50,032 | 320,705 | 97,929 | 312,983 | 105,414 |
-| Unicode escape | 1 | 50,271 | 264 | 388 | 3 |
-| Complete | 1 | 50,256 | 256 | 382 | 2 |
+| Start | 2 | 50,259 | 259 | 322 → 189 | 2 → 1 |
+| Action enum | 8 | 52,508 | 354 | 520 → 364 | 4 → 2 |
+| Query text | 50,032 | 320,705 | 97,929 | 293,614 → 116,631 | 100,759 → 45,316 |
+| Unicode escape | 1 | 50,271 | 264 | 385 → 189 | 2 → 1 |
+| Complete | 1 | 50,256 | 256 | 375 → 127 | 2 → <1 |
 
-The free-form string state still visits most of the trie. The measurements show where prefix sharing helps and where additional mask caching or a different parser representation would matter. This benchmark uses a real tokenizer vocabulary with predetermined parser states. The two decoding examples still use fixture logits.
+The low single-digit rows approach the timer's microsecond output resolution. A diagnostic build of each revision emitted the exact allowed token IDs for each state and their output was byte-identical. The chart indexes add storage per live column. The workload uses a real tokenizer vocabulary with predetermined parser states, and the decoding examples use fixture logits.
 
 ## Model integration
 
@@ -79,4 +81,4 @@ xcrun llvm-cov report "$cov_dir/build/debug/grammar-decoder" \
   src/lib.rs src/json_schema.rs src/json_schema/syntax.rs src/main.rs src/mask_benchmark.rs
 ```
 
-Ten tests covered 798 of 808 production lines (98.76%) and 627 of 652 regions (96.17%). Stable Rust emitted no branch counters for this build. The remaining lines handle compiler invariants, errors from serializing in-memory JSON, and failures of the bundled demo and benchmark checks.
+Eleven tests covered 834 of 844 production lines (98.82%) and 633 of 659 regions (96.05%). Stable Rust emitted no branch counters for this build. The remaining lines handle compiler invariants, errors from serializing in-memory JSON, and failures of the bundled demo and benchmark checks.
