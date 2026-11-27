@@ -446,6 +446,8 @@ impl std::error::Error for DecodeError {}
 
 pub struct DecodeOptions {
     pub eos: usize,
+    /// Maximum number of non-EOS tokens. At the limit only EOS can complete a
+    /// generation, and it must still have a finite score and an accepting parse.
     pub max_tokens: usize,
     pub temperature: f64,
     pub seed: u64,
@@ -494,6 +496,10 @@ pub fn decode_with_vocabulary(
         candidates.clear();
         logits.fill(f64::NEG_INFINITY);
         source.logits(&mut logits);
+        // A continuation cannot displace EOS once the output budget is spent.
+        if step == options.max_tokens && parser.accepting() && logits[options.eos].is_finite() {
+            return Ok(generation);
+        }
         let finite = logits.iter().filter(|score| score.is_finite()).count();
         // Pre-filtered logits can be sparse enough that walking the whole trie
         // costs more than parsing the few candidates independently.

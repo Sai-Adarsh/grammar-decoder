@@ -58,7 +58,11 @@ fn unconstrained(
 ) -> &'static str {
     let mut logits = vec![f64::NEG_INFINITY; tokens.pieces.len()];
     for step in 0..=max_tokens {
+        logits.fill(f64::NEG_INFINITY);
         source.logits(&mut logits);
+        if step == max_tokens && logits[tokens.eos].is_finite() {
+            return "eos";
+        }
         let best = logits
             .iter()
             .enumerate()
@@ -150,6 +154,7 @@ impl Benchmark<'_, '_> {
             .collect();
         let (json_valid, schema_valid, validation_error) = validate(&output, self.validator);
         let request_time = start.elapsed();
+        let eos_at_budget = stop == "eos" && source.generated.len() == self.max_tokens;
         let text = std::str::from_utf8(&output).ok();
         let output_hex = text.is_none().then(|| {
             let mut hex = String::with_capacity(output.len() * 2);
@@ -162,7 +167,8 @@ impl Benchmark<'_, '_> {
             "kind":"sample", "prompt_id":prompt.id, "pair":pair, "first":first.name(), "mode":mode.name(),
             "prompt_tokens":prompt_tokens.len(), "generated_tokens":source.generated.len(),
             "output_token_ids":source.generated, "output":text, "output_hex":output_hex,
-            "status":stop, "json_valid":json_valid, "schema_valid":schema_valid, "validation_error":validation_error,
+            "status":stop, "eos_at_budget":eos_at_budget, "json_valid":json_valid,
+            "schema_valid":schema_valid, "validation_error":validation_error,
             "columns_per_logit_row":self.tokens.pieces.len(), "logit_rows":source.logit_rows,
             "nonfinite_logits":source.nonfinite_logits, "allocated_context":source.allocated_context(),
             "prefill_ns":source.prefill_time.as_nanos(), "native_decode_ns":source.model_decode_time.as_nanos(),
@@ -269,6 +275,28 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_benchmark_uses_the_same_eos_budget_rule() {
+        struct FixedLogits {
+            accepted: Vec<usize>,
+            eos_score: f64,
+        }
+        impl LogitSource for FixedLogits {
+            fn logits(&mut self, output: &mut [f64]) {
+                output.copy_from_slice(&[100.0, self.eos_score]);
+            }
+            fn accept(&mut self, token_id: usize) {
+                self.accepted.push(token_id);
+            }
+        }
+        let tokens = Tokens { pieces: vec![b"1".to_vec(), vec![]], eos: 1 };
+        for (eos_score, expected) in [(-100.0, "eos"), (f64::NEG_INFINITY, "token_budget")] {
+            let mut source = FixedLogits { accepted: vec![], eos_score };
+            assert_eq!(unconstrained(&mut source, &tokens, 1), expected);
+            assert_eq!(source.accepted, [0]);
+        }
+    }
 
     #[test]
     fn validator_distinguishes_syntax_from_schema_constraints() {
