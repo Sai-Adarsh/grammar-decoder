@@ -1,12 +1,18 @@
 # Grammar-constrained decoding
 
-A Rust sampler uses an incremental Earley parser to check the bytes of each candidate token. It samples only legal tokens at the configured temperature, advances the parser after selection, and admits the end-of-sequence token only when the grammar accepts the output. The token cap counts emitted content tokens. At the cap, a complete value can terminate with a finite EOS score even if another content token has a higher score. An incomplete value or a generation with no viable token returns an error.
+This Rust sampler checks candidate token bytes with an incremental Earley parser. It samples only legal tokens at the configured temperature and advances the parser after selection.
+
+## Run the fixture
 
 ```sh
 cargo run --locked --release
 ```
 
 The fixture assigns the highest logit to an illegal token and splits a UTF-8 code point and a JSON escape across token boundaries. The grammar comes from [the tool call schema](examples/tool-call.schema.json). It accepts `search` or `answer` as the action, a query string, and an integer limit from 1 to 10.
+
+### When generation stops
+
+EOS is legal only when the grammar accepts the output. The token cap counts emitted content tokens. At the cap, a complete value can terminate with a finite EOS score even if another content token scores higher. An incomplete value at the cap or a generation with no viable token returns an error.
 
 ## Decode with a JSON Schema
 
@@ -17,7 +23,9 @@ printf '%s\n' '{"jobs":[{"name":"index","timeout":1.5},{"name":"clean","dryRun":
 
 The CLI reads a compact JSON candidate from stdin. A fixture assigns a score to each candidate byte, and the sampler applies the grammar before selecting it. The command prints the completed document after accepting the end-of-sequence token. Rejection reports the byte offset.
 
-The compiler supports this subset of [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-validation):
+### Supported schema constructs
+
+The compiler implements a subset of [JSON Schema Draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-validation).
 
 - Closed objects with `additionalProperties: false`, declared `properties`, and optional `required`. Fields appear in schema order and can be omitted unless required.
 - Arrays with one `items` schema. An array may be empty.
@@ -26,17 +34,21 @@ The compiler supports this subset of [JSON Schema Draft 2020-12](https://json-sc
 
 The optional root `$schema` must name Draft 2020-12. The compiler accepts `title`, `description`, and `$comment` as string annotations. It rejects unsupported constructs such as references, union types, and length or range constraints, and reports the location in the schema. The grammar emits compact JSON. A valid document with a different field order or formatting may fail to parse.
 
+### Input limits
+
 Before expanding rules, the compiler caps schemas at 64 nested JSON value levels, 512 values, and 8 KiB of combined UTF-8 key and string bytes. These limits include values in `enum` and `const`. The CLI accepts up to 64 KiB of schema input and 16 KiB of candidate input, counting whitespace.
 
 ## Share parser states across equivalent bytes
 
 `Vocabulary::new` shares exact token-byte prefixes. `Vocabulary::for_grammar` can merge additional prefixes when the grammar treats different bytes identically. It partitions the 256 bytes by membership in every terminal byte set and uses the smallest byte in each class as its representative. Two equivalent prefixes have the same length and match the same terminals at each position, so they produce the same Earley chart. Each trie node retains all original token IDs that end there. Sampling and commit still use the original bytes.
 
-The one-shot `decode` entry point builds the projected trie. With `decode_with_vocabulary`, reuse a prepared trie across requests. A different byte partition triggers per-token scanning with the original bytes. Sparse finite logits also use per-token checks. In either path EOS is legal only when the current parser state accepts. Each chart column indexes terminal transitions and items waiting on nonterminals. The parser retains at most 64 rolled-back columns to reuse their storage.
+The one-shot `decode` entry point builds the projected trie. Use `decode_with_vocabulary` to reuse a prepared trie across requests. A different byte partition triggers per-token scanning with the original bytes. Sparse finite logits also use per-token checks. In either path EOS is legal only when the current parser state accepts.
+
+Each chart column indexes terminal transitions and items waiting on nonterminals. The parser retains at most 64 rolled-back columns to reuse their storage.
 
 ## Masking with the GPT-2 vocabulary
 
-Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community/gpt2/blob/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json) at revision `607a30d783dfa663caf39e06633721c8d4cfcd7e` and run:
+Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community/gpt2/blob/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json) at revision `607a30d783dfa663caf39e06633721c8d4cfcd7e`, then run the mask benchmark.
 
 ```sh
 cargo run --locked --release -- --mask-bench /path/to/tokenizer.json
@@ -44,7 +56,15 @@ cargo run --locked --release -- --mask-bench /path/to/tokenizer.json
 
 The measured tokenizer had SHA-256 `8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6`.
 
-The benchmark compiles [the tool call schema](examples/tool-call.schema.json), then tests five prefixes. It times the original per-token reference, exact byte trie, and projected trie in the same release process. All three paths use separate parsers, one untimed warmup per state, and 12 timed passes in balanced order. Each trial compares the complete masks across all 50,257 token IDs. The CSV reports attempted chart transitions and medians using wall-clock `Instant`. Vocabulary builds, prefix setup, and exact equality checks are outside the mask timings. The projected build includes the byte partition. The existing microsecond columns remain available for the reference and exact byte trie.
+### Benchmark method
+
+The benchmark compiles [the tool call schema](examples/tool-call.schema.json) and tests five prefixes in the same release process. It compares the original per-token reference, exact byte trie, and projected trie.
+
+- Each path uses its own parser and runs one untimed warmup per state. The 12 timed passes use balanced order.
+- Each trial checks the complete masks across all 50,257 token IDs. The CSV reports attempted chart transitions and wall-clock medians measured with `Instant`. It retains the microsecond columns for the reference and exact byte trie.
+- Mask timings exclude vocabulary builds, prefix setup, and exact equality checks. The projected build timing includes the byte partition.
+
+### Measured GPT-2 mask timings
 
 The [recorded run](evidence/gpt2-byte-projection.csv) used rustc 1.87.0 on arm64 macOS 27.2.1. The exact trie uses the traversal from `4f85196`. Across seven independent release processes and all 420 timed trials, the projected trie and exact trie masks both matched the per-token reference bit for bit. The table takes the median of the seven process medians.
 
@@ -57,12 +77,6 @@ The [recorded run](evidence/gpt2-byte-projection.csv) used rustc 1.87.0 on arm64
 | Complete | 1 | 256 | 50 | 1,208 | 791 |
 
 For query text, the per-process medians ranged from 43.81 to 49.23 ms for the exact trie and from 35.60 to 39.72 ms for the projected trie. The benchmark built the exact trie first and the projected trie second. They had 98,024 and 80,538 nodes respectively, with median build times of 11.11 and 7.07 ms. The smallest timings are sensitive to timer overhead. These measurements cover mask generation on one host with fixed schema prefixes. The [earlier run](evidence/gpt2-earley-before-after.csv) measured the chart indexing changes separately.
-
-## Model integration
-
-Implement `LogitSource` for next-token scores and model state updates. Pass a vocabulary indexed by token ID and identify the end-of-sequence token. For tokenizers with context-dependent detokenization, adapt piece-to-byte decoding before passing it to the parser.
-
-Pass a `serde_json::Value` to `json_schema::compile`, or use `Grammar::new` to supply another context-free grammar. Validate application-specific rules separately.
 
 ## Run a real model with llama.cpp
 
@@ -80,9 +94,13 @@ cargo build --locked --release --features native-llama
   examples/scene.schema.json examples/scene-prompts.json 48 4 1 > tinystories.jsonl
 ```
 
+### Sampling and validation
+
 The runner maps every token ID to continuation bytes using the checkpoint's own tokenizer and copies the entire native FP32 row from `llama_get_logits_ith` before each selection. Each mode uses greedy sampling and a fresh CPU context. They share the prompt, budget, and canonical EOS. Both modes exclude control pieces and other stop IDs from selection. The constrained mode masks bytes before scoring and permits EOS only at a complete grammar state.
 
 The runner discards a warmup for each mode and alternates order across prompt pairs. Both modes apply the same content-token cap. It parses the original generated bytes with serde_json and validates the result independently using the Draft 2020-12 validator from `jsonschema`. The JSONL includes raw output, token IDs, logit row counts and widths, syntax and schema results, the stop reason, and an `eos_at_budget` flag for completions that stop on the cap row. If a constrained run ends before valid JSON and EOS, the command writes all sample rows, including any partial output, and exits with an error.
+
+### Timing boundaries
 
 Request time covers tokenization, context setup, prefill, generation, and validation. The first-token field measures selection inside the process. Model loading and trie preparation have separate timings. Mode comparisons include differences in the number of tokens generated.
 
@@ -104,6 +122,8 @@ value. Timings describe the complete requests, whose output lengths
 differ between modes.
 [Raw responses and timings](evidence/tinystories-native-json.jsonl) · [Checksums](evidence/tinystories-native-json.sha256)
 
+### Native regression
+
 The optional native regression needs the same local GGUF and bindings.
 
 ```sh
@@ -111,6 +131,12 @@ GRAMMAR_TEST_MODEL=/path/to/stories15M.gguf \
   cargo test --locked --release --features native-llama \
   native_model_emits_independently_validated_json_and_full_logit_rows -- --ignored
 ```
+
+## Model integration
+
+Implement `LogitSource` for next-token scores and model state updates. Pass a vocabulary indexed by token ID and identify the end-of-sequence token. For tokenizers with context-dependent detokenization, adapt piece-to-byte decoding before passing it to the parser.
+
+Pass a `serde_json::Value` to `json_schema::compile`, or use `Grammar::new` to supply another context-free grammar. Validate application-specific rules separately.
 
 ## Tests and coverage
 
