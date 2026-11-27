@@ -1,3 +1,5 @@
+mod mask_benchmark;
+
 use grammar_decoder::{decode, json_schema, DecodeError, DecodeOptions, Generation, LogitSource};
 use std::error::Error;
 use std::fs;
@@ -101,13 +103,15 @@ fn run() -> Result<(), Box<dyn Error>> {
     let output = match args.as_slice() {
         [] => fixture()?,
         [flag, path] if flag == "--schema" => schema_demo(Path::new(path))?,
-        _ => return Err("usage: grammar-decoder [--schema SCHEMA.json < compact.json]".into()),
+        [flag, path] if flag == "--mask-bench" => return mask_benchmark::run(Path::new(path)),
+        _ => return Err("usage: grammar-decoder [--schema SCHEMA.json < compact.json | --mask-bench GPT2_TOKENIZER.json]".into()),
     };
     println!("{}", std::str::from_utf8(&output.bytes)?);
     eprintln!(
-        "{} emitted tokens, {} candidate rejections",
+        "{} emitted tokens, {} candidate rejections, {} attempted mask bytes",
         output.token_ids.len(),
-        output.rejected_candidates
+        output.rejected_candidates,
+        output.attempted_mask_bytes
     );
     Ok(())
 }
