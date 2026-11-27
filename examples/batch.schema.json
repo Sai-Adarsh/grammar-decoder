@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {"type": "string"},
+          "timeout": {"type": "number"},
+          "dryRun": {"type": "boolean"}
+        },
+        "required": ["name"],
+        "additionalProperties": false
+      }
+    },
+    "version": {"const": 1}
+  },
+  "required": ["jobs", "version"],
+  "additionalProperties": false
+}
