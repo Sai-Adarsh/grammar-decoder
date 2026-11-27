@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "setting": { "enum": ["forest", "park", "school"] },
+    "character": { "enum": ["boy", "girl", "fox"] },
+    "mood": { "enum": ["happy", "scared", "sad"] }
+  },
+  "required": ["setting", "character", "mood"],
+  "additionalProperties": false
+}

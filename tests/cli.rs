@@ -112,6 +112,121 @@ fn schema_cli_rejects_partial_or_oversized_documents() {
     );
 }
 
+#[cfg(not(feature = "native-llama"))]
+#[test]
+fn native_benchmark_reports_the_required_feature() {
+    failure(
+        cli(
+            &[
+                "--llama-bench",
+                "model",
+                "schema",
+                "prompts",
+                "48",
+                "1",
+                "4",
+            ],
+            b"",
+        ),
+        "rebuild with --features native-llama",
+    );
+}
+
+#[cfg(feature = "native-llama")]
+#[test]
+fn native_benchmark_validates_inputs_before_loading_models() {
+    failure(
+        cli(
+            &["--llama-bench", "model", "schema", "prompts", "0", "1", "4"],
+            b"",
+        ),
+        "MAX_TOKENS must be an integer from 1 to 256",
+    );
+    let work = Work::new();
+    let schema = work.write(
+        "schema.json",
+        include_bytes!("../examples/scene.schema.json"),
+    );
+    let duplicate = work.write(
+        "prompts.json",
+        br#"[{"id":"a","prompt":"one"},{"id":"a","prompt":"two"}]"#,
+    );
+    failure(
+        cli(
+            &[
+                "--llama-bench",
+                "missing-model",
+                schema.to_str().unwrap(),
+                duplicate.to_str().unwrap(),
+                "48",
+                "1",
+                "4",
+            ],
+            b"",
+        ),
+        "unique nonempty IDs",
+    );
+}
+
+#[cfg(feature = "native-llama")]
+#[test]
+#[ignore = "requires the cached TinyStories GGUF in GRAMMAR_TEST_MODEL"]
+fn native_model_emits_independently_validated_json_and_full_logit_rows() {
+    let model = std::env::var("GRAMMAR_TEST_MODEL").expect("set GRAMMAR_TEST_MODEL");
+    let work = Work::new();
+    let schema = work.write(
+        "schema.json",
+        include_bytes!("../examples/scene.schema.json"),
+    );
+    let prompts = work.write(
+        "prompts.json",
+        include_bytes!("../examples/scene-prompts.json"),
+    );
+    let out = cli(
+        &[
+            "--llama-bench",
+            &model,
+            schema.to_str().unwrap(),
+            prompts.to_str().unwrap(),
+            "48",
+            "1",
+            "1",
+        ],
+        b"",
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|row| serde_json::from_str(row).unwrap())
+        .collect();
+    assert_eq!(rows.len(), 7);
+    assert_eq!(rows[0]["kind"], "config");
+    assert_eq!(rows[0]["vocabulary_size"], 32_000);
+    assert!(rows[1..].iter().all(|row| {
+        row["columns_per_logit_row"] == 32_000
+            && row["nonfinite_logits"] == 0
+            && row["logit_rows"].as_u64().unwrap() == row["generated_tokens"].as_u64().unwrap() + 1
+    }));
+    let constrained: Vec<_> = rows[1..]
+        .iter()
+        .filter(|row| row["mode"] == "constrained")
+        .collect();
+    assert_eq!(constrained.len(), 3);
+    for row in constrained {
+        assert_eq!(row["json_valid"], true);
+        assert_eq!(row["schema_valid"], true);
+        assert_eq!(row["status"], "eos");
+        assert!(row["mask_attempts"].as_u64().unwrap() > 0);
+        let generated: Value = serde_json::from_str(row["output"].as_str().unwrap()).unwrap();
+        assert_eq!(generated.as_object().unwrap().len(), 3);
+    }
+}
+
 fn tokenizer() -> Value {
     let mut vocab = Map::new();
     for id in 0..50_253 {

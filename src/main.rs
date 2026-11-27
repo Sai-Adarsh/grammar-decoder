@@ -1,4 +1,8 @@
 mod mask_benchmark;
+#[cfg(feature = "native-llama")]
+mod native_llama;
+#[cfg(feature = "native-llama")]
+mod model_benchmark;
 
 use grammar_decoder::{decode, json_schema, DecodeError, DecodeOptions, Generation, LogitSource};
 use std::error::Error;
@@ -104,7 +108,19 @@ fn run() -> Result<(), Box<dyn Error>> {
         [] => fixture()?,
         [flag, path] if flag == "--schema" => schema_demo(Path::new(path))?,
         [flag, path] if flag == "--mask-bench" => return mask_benchmark::run(Path::new(path)),
-        _ => return Err("usage: grammar-decoder [--schema SCHEMA.json < compact.json | --mask-bench GPT2_TOKENIZER.json]".into()),
+        [flag, model, schema, prompts, tokens, pairs, threads] if flag == "--llama-bench" => {
+            #[cfg(feature = "native-llama")]
+            return model_benchmark::run(Path::new(model), Path::new(schema), Path::new(prompts), tokens, pairs, threads);
+            #[cfg(not(feature = "native-llama"))]
+            {
+                let _ = (model, schema, prompts, tokens, pairs, threads);
+                return Err("rebuild with --features native-llama to use --llama-bench".into());
+            }
+        }
+        _ => return Err(concat!(
+            "usage: grammar-decoder [--schema SCHEMA.json < compact.json | --mask-bench GPT2_TOKENIZER.json | ",
+            "--llama-bench MODEL.gguf SCHEMA.json PROMPTS.json MAX_TOKENS PAIRS THREADS]"
+        ).into()),
     };
     println!("{}", std::str::from_utf8(&output.bytes)?);
     eprintln!(
