@@ -1,72 +1,9 @@
-use grammar_decoder::{decode, ByteSet, DecodeOptions, Grammar, LogitSource, Symbol};
-use Symbol::Rule;
-
-fn lit(bytes: &[u8]) -> Vec<Symbol> {
-    bytes.iter().copied().map(Symbol::from).collect()
-}
-
-fn class(ranges: &[(u8, u8)]) -> Symbol {
-    Symbol::Byte(ByteSet::ranges(ranges))
-}
-
-fn tool_call_grammar() -> Grammar {
-    const CALL: usize = 0;
-    const ACTION: usize = 1;
-    const LIMIT: usize = 2;
-    const STRING: usize = 3;
-    const BODY: usize = 4;
-    const CH: usize = 5;
-    const HEX: usize = 6;
-    const NON_SURROGATE: usize = 7;
-    const HIGH_SURROGATE: usize = 8;
-    const LOW_SURROGATE: usize = 9;
-    let mut root = lit(b"{\"action\":");
-    root.push(Rule(ACTION));
-    root.extend(lit(b",\"query\":"));
-    root.push(Rule(STRING));
-    root.extend(lit(b",\"limit\":"));
-    root.push(Rule(LIMIT));
-    root.extend(lit(b"}"));
-
-    let cont = || class(&[(0x80, 0xbf)]);
-    let hex = || Rule(HEX);
-    let start_escape = || lit(br"\u");
-    let mut unicode = start_escape();
-    unicode.push(Rule(NON_SURROGATE));
-    let mut surrogate_pair = start_escape();
-    surrogate_pair.push(Rule(HIGH_SURROGATE));
-    surrogate_pair.extend(start_escape());
-    surrogate_pair.push(Rule(LOW_SURROGATE));
-    let mut rules = vec![
-        (CALL, root),
-        (ACTION, lit(b"\"search\"")),
-        (ACTION, lit(b"\"answer\"")),
-        (LIMIT, vec![class(&[(b'1', b'9')])]),
-        (LIMIT, lit(b"10")),
-        (STRING, vec![b'"'.into(), Rule(BODY), b'"'.into()]),
-        (BODY, vec![]),
-        (BODY, vec![Rule(CH), Rule(BODY)]),
-        (CH, vec![class(&[(0x20, 0x21), (0x23, 0x5b), (0x5d, 0x7f)])]),
-        (CH, vec![class(&[(0xc2, 0xdf)]), cont()]),
-        (CH, vec![0xe0.into(), class(&[(0xa0, 0xbf)]), cont()]),
-        (CH, vec![class(&[(0xe1, 0xec), (0xee, 0xef)]), cont(), cont()]),
-        (CH, vec![0xed.into(), class(&[(0x80, 0x9f)]), cont()]),
-        (CH, vec![0xf0.into(), class(&[(0x90, 0xbf)]), cont(), cont()]),
-        (CH, vec![class(&[(0xf1, 0xf3)]), cont(), cont(), cont()]),
-        (CH, vec![0xf4.into(), class(&[(0x80, 0x8f)]), cont(), cont()]),
-        (CH, unicode),
-        (CH, surrogate_pair),
-        (HEX, vec![class(&[(b'0', b'9'), (b'A', b'F'), (b'a', b'f')])]),
-        (NON_SURROGATE, vec![class(&[(b'0', b'9'), (b'A', b'C'), (b'E', b'F'), (b'a', b'c'), (b'e', b'f')]), hex(), hex(), hex()]),
-        (NON_SURROGATE, vec![class(&[(b'D', b'D'), (b'd', b'd')]), class(&[(b'0', b'7')]), hex(), hex()]),
-        (HIGH_SURROGATE, vec![class(&[(b'D', b'D'), (b'd', b'd')]), class(&[(b'8', b'9'), (b'A', b'B'), (b'a', b'b')]), hex(), hex()]),
-        (LOW_SURROGATE, vec![class(&[(b'D', b'D'), (b'd', b'd')]), class(&[(b'C', b'F'), (b'c', b'f')]), hex(), hex()]),
-    ];
-    for escaped in [b'"', b'\\', b'/', b'b', b'f', b'n', b'r', b't'] {
-        rules.push((CH, vec![b'\\'.into(), escaped.into()]));
-    }
-    Grammar::new(CALL, rules).expect("valid tool-call grammar")
-}
+use grammar_decoder::{decode, json_schema, DecodeError, DecodeOptions, Generation, LogitSource};
+use std::error::Error;
+use std::fs;
+use std::io::{self, Read};
+use std::path::Path;
+use std::process::ExitCode;
 
 struct FixtureLogits(usize);
 
@@ -75,9 +12,9 @@ impl LogitSource for FixtureLogits {
         // The top scorer is illegal in every position, including after the final brace.
         output[0] = 15.0;
         output[(self.0 + 1).min(8)] = 8.0;
-        for id in 1..output.len() {
-            if output[id] == f64::NEG_INFINITY {
-                output[id] = -30.0;
+        for score in &mut output[1..] {
+            if *score == f64::NEG_INFINITY {
+                *score = -30.0;
             }
         }
     }
@@ -87,7 +24,8 @@ impl LogitSource for FixtureLogits {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn fixture() -> Result<Generation, Box<dyn Error>> {
+    let schema = serde_json::from_str(include_str!("../examples/tool-call.schema.json"))?;
     let vocabulary = vec![
         vec![0xff],
         b"{\"action\":\"".to_vec(),
@@ -99,13 +37,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b"3}".to_vec(),
         vec![],
     ];
-
-    let output = decode(
-        &tool_call_grammar(),
+    Ok(decode(
+        &json_schema::compile(&schema)?,
         &vocabulary,
         &mut FixtureLogits(0),
         DecodeOptions { eos: 8, max_tokens: 16, temperature: 0.7, seed: 42 },
-    )?;
+    )?)
+}
+
+const BYTE_EOS: usize = 256;
+const MAX_SCHEMA_INPUT: usize = 64 * 1024;
+const MAX_CANDIDATE_INPUT: usize = 16 * 1024;
+
+struct CandidateLogits<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl LogitSource for CandidateLogits<'_> {
+    fn logits(&mut self, output: &mut [f64]) {
+        output[0xff] = 15.0;
+        let preferred = self.bytes.get(self.offset).map_or(BYTE_EOS, |byte| usize::from(*byte));
+        output[preferred] = 8.0;
+    }
+
+    fn accept(&mut self, _: usize) {
+        self.offset += 1;
+    }
+}
+
+fn schema_demo(path: &Path) -> Result<Generation, Box<dyn Error>> {
+    let schema_bytes = read_bounded(fs::File::open(path)?, MAX_SCHEMA_INPUT, "schema")?;
+    let schema = serde_json::from_slice(&schema_bytes)?;
+    let grammar = json_schema::compile(&schema)?;
+    let input = read_bounded(io::stdin().lock(), MAX_CANDIDATE_INPUT, "candidate")?;
+    let bytes = input.trim_ascii();
+    let mut vocabulary: Vec<Vec<u8>> = (0..=u8::MAX).map(|byte| vec![byte]).collect();
+    vocabulary.push(vec![]);
+    let mut source = CandidateLogits { bytes, offset: 0 };
+    decode(
+        &grammar,
+        &vocabulary,
+        &mut source,
+        DecodeOptions { eos: BYTE_EOS, max_tokens: bytes.len(), temperature: 0.0, seed: 0 },
+    )
+    .map_err(|err| match err {
+        DecodeError::NoViableToken => format!("candidate rejected at byte {}", source.offset).into(),
+        _ => err.into(),
+    })
+}
+
+fn read_bounded(reader: impl Read, max_bytes: usize, label: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut bytes = Vec::new();
+    reader.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(format!("{label} input exceeds {max_bytes} bytes").into());
+    }
+    Ok(bytes)
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let output = match args.as_slice() {
+        [] => fixture()?,
+        [flag, path] if flag == "--schema" => schema_demo(Path::new(path))?,
+        _ => return Err("usage: grammar-decoder [--schema SCHEMA.json < compact.json]".into()),
+    };
     println!("{}", std::str::from_utf8(&output.bytes)?);
     eprintln!(
         "{} emitted tokens, {} candidate rejections",
@@ -113,4 +110,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.rejected_candidates
     );
     Ok(())
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("{err}");
+            ExitCode::FAILURE
+        }
+    }
 }

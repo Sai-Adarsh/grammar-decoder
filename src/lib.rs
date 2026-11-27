@@ -1,3 +1,5 @@
+pub mod json_schema;
+
 use std::collections::HashSet;
 use std::fmt;
 
