@@ -1,9 +1,10 @@
 pub mod json_schema;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::OnceLock;
 
-#[derive(Clone)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub struct ByteSet([u64; 4]);
 
 impl ByteSet {
@@ -42,6 +43,7 @@ pub struct Grammar {
     productions: Vec<(usize, Vec<Symbol>)>,
     by_lhs: Vec<Vec<usize>>,
     nullable: Vec<bool>,
+    byte_representatives: OnceLock<[u8; 256]>,
 }
 
 impl Grammar {
@@ -91,8 +93,41 @@ impl Grammar {
             return Err("rule ids must be contiguous and all rules must derive terminal bytes");
         }
         let nullable = fixed_point(true);
-        Ok(Self { productions, by_lhs, nullable })
+        Ok(Self { productions, by_lhs, nullable, byte_representatives: OnceLock::new() })
     }
+
+    fn byte_representatives(&self) -> &[u8; 256] {
+        self.byte_representatives.get_or_init(|| {
+            byte_representatives(
+                self.productions.iter().flat_map(|(_, rhs)| rhs).filter_map(|symbol| match symbol {
+                    Symbol::Byte(set) => Some(set),
+                    Symbol::Rule(_) => None,
+                }),
+            )
+        })
+    }
+}
+
+fn byte_representatives<'a>(sets: impl Iterator<Item = &'a ByteSet>) -> [u8; 256] {
+    let mut representatives = [0; 256];
+    let mut seen = HashSet::new();
+    for set in sets.filter(|&set| seen.insert(set)) {
+        // Refine each existing class by membership in this terminal. The
+        // smallest byte in each class is its actual scanner input.
+        let mut first = [None; 512];
+        let mut classes = 0;
+        for (byte, representative) in (0..=u8::MAX).zip(&mut representatives) {
+            let part = usize::from(*representative) * 2 + usize::from(set.contains(byte));
+            *representative = *first[part].get_or_insert_with(|| {
+                classes += 1;
+                byte
+            });
+        }
+        if classes == 256 {
+            break;
+        }
+    }
+    representatives
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -112,6 +147,9 @@ impl Item {
 struct Column {
     items: Vec<Item>,
     seen: HashSet<Item>,
+    terminals: Vec<Item>,
+    waiting_heads: HashMap<usize, usize>,
+    waiting: Vec<(Item, Option<usize>)>,
 }
 
 impl Column {
@@ -120,16 +158,32 @@ impl Column {
             self.items.push(item);
         }
     }
+
+    fn wait_for(&mut self, rule: usize, item: Item) {
+        let previous = self.waiting_heads.insert(rule, self.waiting.len());
+        self.waiting.push((item, previous));
+    }
+
+    fn clear(&mut self) {
+        self.items.clear();
+        self.seen.clear();
+        self.terminals.clear();
+        self.waiting_heads.clear();
+        self.waiting.clear();
+    }
 }
+
+const REUSABLE_COLUMNS: usize = 64;
 
 pub struct Parser<'grammar> {
     grammar: &'grammar Grammar,
     chart: Vec<Column>,
+    scratch: Vec<Column>,
 }
 
 impl<'grammar> Parser<'grammar> {
     pub fn new(grammar: &'grammar Grammar) -> Self {
-        let mut parser = Self { grammar, chart: vec![Column::default()] };
+        let mut parser = Self { grammar, chart: vec![Column::default()], scratch: Vec::new() };
         parser.chart[0].insert(Item { production: 0, dot: 0, origin: 0 });
         parser.close();
         parser
@@ -137,19 +191,22 @@ impl<'grammar> Parser<'grammar> {
 
     fn close(&mut self) {
         let current = self.chart.len() - 1;
+        let (prior, active) = self.chart.split_at_mut(current);
+        let column = &mut active[0];
         let mut cursor = 0;
-        while cursor < self.chart[current].items.len() {
-            let item = self.chart[current].items[cursor];
+        while cursor < column.items.len() {
+            let item = column.items[cursor];
             cursor += 1;
             let (lhs, rhs) = &self.grammar.productions[item.production];
             match rhs.get(item.dot) {
-                Some(Symbol::Byte(_)) => {}
+                Some(Symbol::Byte(_)) => column.terminals.push(item),
                 Some(Symbol::Rule(rule)) => {
+                    column.wait_for(*rule, item);
                     for &production in &self.grammar.by_lhs[*rule] {
-                        self.chart[current].insert(Item { production, dot: 0, origin: current });
+                        column.insert(Item { production, dot: 0, origin: current });
                     }
                     if self.grammar.nullable[*rule] {
-                        self.chart[current].insert(item.advance());
+                        column.insert(item.advance());
                     }
                 }
                 None => {
@@ -157,12 +214,12 @@ impl<'grammar> Parser<'grammar> {
                     if item.origin == current {
                         continue;
                     }
-                    for index in 0..self.chart[item.origin].items.len() {
-                        let previous = self.chart[item.origin].items[index];
-                        let rhs = &self.grammar.productions[previous.production].1;
-                        if matches!(rhs.get(previous.dot), Some(Symbol::Rule(rule)) if rule == lhs) {
-                            self.chart[current].insert(previous.advance());
-                        }
+                    let origin = &prior[item.origin];
+                    let mut waiter = origin.waiting_heads.get(lhs).copied();
+                    while let Some(index) = waiter {
+                        let (previous, next) = origin.waiting[index];
+                        column.insert(previous.advance());
+                        waiter = next;
                     }
                 }
             }
@@ -170,19 +227,38 @@ impl<'grammar> Parser<'grammar> {
     }
 
     fn scan(&mut self, byte: u8) -> bool {
-        let mut next = Column::default();
-        for &item in &self.chart.last().expect("initial column").items {
-            let rhs = &self.grammar.productions[item.production].1;
-            if matches!(rhs.get(item.dot), Some(Symbol::Byte(set)) if set.contains(byte)) {
-                next.insert(item.advance());
-            }
-        }
-        if next.items.is_empty() {
+        let grammar = self.grammar;
+        let mut matches = self.chart.last().expect("initial column").terminals.iter()
+            .filter_map(|&item| {
+                let rhs = &grammar.productions[item.production].1;
+                matches!(rhs.get(item.dot), Some(Symbol::Byte(set)) if set.contains(byte))
+                    .then(|| item.advance())
+            });
+        let Some(first) = matches.next() else {
             return false;
+        };
+        let mut next = self.scratch.pop().unwrap_or_default();
+        next.insert(first);
+        for item in matches {
+            next.insert(item);
         }
         self.chart.push(next);
         self.close();
         true
+    }
+
+    fn recycle(&mut self, mut column: Column) {
+        if self.scratch.len() < REUSABLE_COLUMNS {
+            column.clear();
+            self.scratch.push(column);
+        }
+    }
+
+    fn restore(&mut self, checkpoint: usize) {
+        while self.chart.len() > checkpoint {
+            let column = self.chart.pop().expect("column after checkpoint");
+            self.recycle(column);
+        }
     }
 
     pub fn accepting(&self) -> bool {
@@ -199,7 +275,7 @@ impl<'grammar> Parser<'grammar> {
         if bytes.iter().all(|byte| self.scan(*byte)) {
             true
         } else {
-            self.chart.truncate(checkpoint);
+            self.restore(checkpoint);
             false
         }
     }
@@ -210,7 +286,7 @@ impl<'grammar> Parser<'grammar> {
             *attempted_bytes += 1;
             self.scan(*byte)
         });
-        self.chart.truncate(checkpoint);
+        self.restore(checkpoint);
         valid
     }
 }
@@ -221,18 +297,38 @@ struct TrieNode {
     token_ids: Vec<usize>,
 }
 
-/// An immutable byte trie reusable across requests with the same token vocabulary.
+/// An immutable vocabulary trie reusable across requests.
 pub struct Vocabulary<'tokens> {
     tokens: &'tokens [Vec<u8>],
     eos: usize,
     nodes: Vec<TrieNode>,
+    byte_representatives: Option<[u8; 256]>,
 }
 
 impl<'tokens> Vocabulary<'tokens> {
     pub fn new(tokens: &'tokens [Vec<u8>], eos: usize) -> Result<Self, DecodeError> {
+        Self::build(tokens, eos, None)
+    }
+
+    /// Build a trie that shares transitions for bytes indistinguishable by the grammar.
+    pub fn for_grammar(
+        tokens: &'tokens [Vec<u8>],
+        eos: usize,
+        grammar: &Grammar,
+    ) -> Result<Self, DecodeError> {
+        Self::build(tokens, eos, Some(*grammar.byte_representatives()))
+    }
+
+    fn build(
+        tokens: &'tokens [Vec<u8>],
+        eos: usize,
+        byte_representatives: Option<[u8; 256]>,
+    ) -> Result<Self, DecodeError> {
         if eos >= tokens.len() {
             return Err(DecodeError::InvalidConfig);
         }
+        let identity = std::array::from_fn(|byte| byte as u8);
+        let alphabet = byte_representatives.as_ref().unwrap_or(&identity);
         let mut nodes = vec![TrieNode::default()];
         for (id, token) in tokens.iter().enumerate() {
             if id == eos || token.is_empty() {
@@ -240,6 +336,7 @@ impl<'tokens> Vocabulary<'tokens> {
             }
             let mut parent = 0;
             for &byte in token {
+                let byte = alphabet[usize::from(byte)];
                 parent = match nodes[parent].edges.iter().find(|edge| edge.0 == byte) {
                     Some(&(_, child)) => child,
                     None => {
@@ -252,7 +349,7 @@ impl<'tokens> Vocabulary<'tokens> {
             }
             nodes[parent].token_ids.push(id);
         }
-        Ok(Self { tokens, eos, nodes })
+        Ok(Self { tokens, eos, nodes, byte_representatives })
     }
 
     pub fn trie_nodes(&self) -> usize {
@@ -260,10 +357,18 @@ impl<'tokens> Vocabulary<'tokens> {
     }
 
     /// Fill a dense mask and return the number of attempted parser byte transitions.
-    /// Use the individual path as a reference when measuring the two algorithms.
+    /// The individual path checks original bytes and also serves as a fallback when
+    /// a prepared trie is used with a grammar whose byte partition differs.
     pub fn mask(&self, parser: &mut Parser<'_>, allowed: &mut [bool], method: MaskMethod) -> usize {
         assert_eq!(allowed.len(), self.tokens.len());
         allowed.fill(false);
+        let method = match method {
+            MaskMethod::Trie if self.byte_representatives
+                .as_ref()
+                .is_some_and(|alphabet| alphabet != parser.grammar.byte_representatives()) =>
+                MaskMethod::Individual,
+            other => other,
+        };
         let mut attempted = 0;
         match method {
             MaskMethod::Individual => {
@@ -276,6 +381,7 @@ impl<'tokens> Vocabulary<'tokens> {
             MaskMethod::Trie => {
                 // One parser column per successful edge. Popping an exhausted child
                 // restores its parent so each sibling starts from the same state.
+                let checkpoint = parser.chart.len();
                 let mut stack = vec![(0, 0)];
                 while let Some((node, next_edge)) = stack.last_mut() {
                     if let Some(&(byte, child)) = self.nodes[*node].edges.get(*next_edge) {
@@ -289,9 +395,7 @@ impl<'tokens> Vocabulary<'tokens> {
                         }
                     } else {
                         stack.pop();
-                        if !stack.is_empty() {
-                            parser.chart.pop();
-                        }
+                        parser.restore(checkpoint + stack.len().saturating_sub(1));
                     }
                 }
             }
@@ -354,7 +458,12 @@ pub fn decode(
     source: &mut impl LogitSource,
     options: DecodeOptions,
 ) -> Result<Generation, DecodeError> {
-    decode_with_vocabulary(grammar, &Vocabulary::new(vocabulary, options.eos)?, source, options)
+    decode_with_vocabulary(
+        grammar,
+        &Vocabulary::for_grammar(vocabulary, options.eos, grammar)?,
+        source,
+        options,
+    )
 }
 
 pub fn decode_with_vocabulary(

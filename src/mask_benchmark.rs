@@ -60,14 +60,32 @@ fn gpt2_tokens(path: &Path) -> Result<(Vec<Vec<u8>>, usize), Box<dyn Error>> {
 
 pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
     let (tokens, eos) = gpt2_tokens(path)?;
-    let start = Instant::now();
-    let vocabulary = Vocabulary::new(&tokens, eos)?;
-    eprintln!("vocabulary={} trie_nodes={} build_us={}", tokens.len(), vocabulary.trie_nodes(),
-              start.elapsed().as_micros());
     let schema = serde_json::from_str(include_str!("../examples/tool-call.schema.json"))?;
     let grammar = json_schema::compile(&schema)?;
-    let mut individual = vec![false; tokens.len()];
-    let mut shared = vec![false; tokens.len()];
+    let start = Instant::now();
+    let vocabulary = Vocabulary::new(&tokens, eos)?;
+    let raw_build = start.elapsed();
+    let start = Instant::now();
+    let projected = Vocabulary::for_grammar(&tokens, eos, &grammar)?;
+    let projected_build = start.elapsed();
+    eprintln!(
+        "vocabulary={} trie_nodes={} build_us={} raw_build_ns={} projected_nodes={} projected_build_ns={}",
+        tokens.len(), vocabulary.trie_nodes(), raw_build.as_micros(), raw_build.as_nanos(),
+        projected.trie_nodes(), projected_build.as_nanos(),
+    );
+
+    let paths = [
+        (&vocabulary, MaskMethod::Individual),
+        (&vocabulary, MaskMethod::Trie),
+        (&projected, MaskMethod::Trie),
+    ];
+    let mut masks: [Vec<bool>; 3] = std::array::from_fn(|_| vec![false; tokens.len()]);
+    // Use all six orders twice so each path appears equally often in each
+    // trial position.
+    const ORDERS: [[usize; 3]; 6] = [
+        [0, 1, 2], [1, 2, 0], [2, 0, 1], [0, 2, 1], [2, 1, 0], [1, 0, 2],
+    ];
+    const TRIALS: usize = ORDERS.len() * 2;
     let cases: [(&str, &[u8]); 5] = [
         ("start", b""),
         ("action_enum", br#"{"action":""#),
@@ -76,42 +94,43 @@ pub fn run(path: &Path) -> Result<(), Box<dyn Error>> {
         ("complete", br#"{"action":"search","query":"hi","limit":3}"#),
     ];
 
-    println!("case,vocabulary,allowed,individual_bytes,trie_bytes,individual_median_us,trie_median_us");
+    println!(concat!(
+        "case,vocabulary,allowed,individual_bytes,trie_bytes,individual_median_us,trie_median_us,",
+        "projected_bytes,trie_median_ns,projected_median_ns"
+    ));
     for (label, prefix) in cases {
-        let mut parser = Parser::new(&grammar);
-        if !parser.commit(prefix) {
+        let mut parsers = paths.map(|_| Parser::new(&grammar));
+        if parsers.iter_mut().any(|parser| !parser.commit(prefix)) {
             return Err(format!("invalid benchmark prefix {label}").into());
         }
-        let mut individual_us = [0; 9];
-        let mut trie_us = [0; 9];
-        let (mut individual_bytes, mut trie_bytes) = (0, 0);
-        for trial in 0..9 {
-            let order = if trial % 2 == 0 {
-                [MaskMethod::Individual, MaskMethod::Trie]
-            } else {
-                [MaskMethod::Trie, MaskMethod::Individual]
-            };
-            for method in order {
+        let mut timings = [[0; TRIALS]; 3];
+        let mut attempts = [0; 3];
+        for (index, &(vocabulary, method)) in paths.iter().enumerate() {
+            vocabulary.mask(&mut parsers[index], &mut masks[index], method);
+        }
+        for (trial, order) in ORDERS.iter().cycle().take(TRIALS).enumerate() {
+            for &index in order {
+                let (vocabulary, method) = paths[index];
                 let start = Instant::now();
-                match method {
-                    MaskMethod::Individual => {
-                        individual_bytes = vocabulary.mask(&mut parser, &mut individual, method);
-                        individual_us[trial] = start.elapsed().as_micros();
-                    }
-                    MaskMethod::Trie => {
-                        trie_bytes = vocabulary.mask(&mut parser, &mut shared, method);
-                        trie_us[trial] = start.elapsed().as_micros();
-                    }
-                }
+                attempts[index] = vocabulary.mask(&mut parsers[index], &mut masks[index], method);
+                timings[index][trial] = start.elapsed().as_nanos();
             }
-            if individual != shared {
+            if masks[0] != masks[1] || masks[0] != masks[2] {
                 return Err(format!("mask differs for prefix {label}").into());
             }
         }
-        individual_us.sort_unstable();
-        trie_us.sort_unstable();
-        println!("{label},{},{},{individual_bytes},{trie_bytes},{},{}", tokens.len(),
-                 shared.iter().filter(|allow| **allow).count(), individual_us[4], trie_us[4]);
+        let [individual_ns, raw_ns, projected_ns] = timings.map(|mut samples| {
+            samples.sort_unstable();
+            let upper = TRIALS / 2;
+            let lower = samples[upper - 1];
+            lower + (samples[upper] - lower) / 2
+        });
+        let [individual_bytes, trie_bytes, projected_bytes] = attempts;
+        println!(
+            "{label},{},{},{individual_bytes},{trie_bytes},{},{},{projected_bytes},{raw_ns},{projected_ns}",
+            tokens.len(), masks[0].iter().filter(|allow| **allow).count(), individual_ns / 1000,
+            raw_ns / 1000,
+        );
     }
     Ok(())
 }

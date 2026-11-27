@@ -28,9 +28,13 @@ The optional root `$schema` must name Draft 2020-12. The compiler accepts `title
 
 Before expanding rules, the compiler caps schemas at 64 nested JSON value levels, 512 values, and 8 KiB of combined UTF-8 key and string bytes. These limits include values in `enum` and `const`. The CLI accepts up to 64 KiB of schema input and 16 KiB of candidate input, counting whitespace.
 
-## Masking with a real vocabulary
+## Share parser states across equivalent bytes
 
-The `Vocabulary` index shares byte prefixes across tokens. One traversal advances the Earley chart once per viable trie edge and rolls it back before visiting a sibling. Invalid prefixes skip whole subtrees. Duplicate byte spellings keep each token ID, and EOS is allowed only when the original parser state accepts. Reuse the index across requests with `decode_with_vocabulary`. When finite logits are sparse, the decoder checks only those candidates individually.
+`Vocabulary::new` shares exact token-byte prefixes. `Vocabulary::for_grammar` can merge additional prefixes when the grammar treats different bytes identically. It partitions the 256 bytes by membership in every terminal byte set and uses the smallest byte in each class as its representative. Two equivalent prefixes have the same length and match the same terminals at each position, so they produce the same Earley chart. Each trie node retains all original token IDs that end there. Sampling and commit still use the original bytes.
+
+The one-shot `decode` entry point builds the projected trie. With `decode_with_vocabulary`, reuse a prepared trie across requests. A different byte partition triggers per-token scanning with the original bytes. Sparse finite logits also use per-token checks. In either path EOS is legal only when the current parser state accepts. Each chart column indexes terminal transitions and items waiting on nonterminals. The parser retains at most 64 rolled-back columns to reuse their storage.
+
+## Masking with the GPT-2 vocabulary
 
 Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community/gpt2/blob/607a30d783dfa663caf39e06633721c8d4cfcd7e/tokenizer.json) at revision `607a30d783dfa663caf39e06633721c8d4cfcd7e` and run:
 
@@ -38,17 +42,21 @@ Download the [GPT-2 ByteLevel tokenizer](https://huggingface.co/openai-community
 cargo run --locked --release -- --mask-bench /path/to/tokenizer.json
 ```
 
-One Apple Silicon run used 50,257 token IDs and a 98,024-node trie. The two masks matched exactly in every state and every trial. Timing is the median of nine alternating passes and excludes index construction, tokenization, and model execution.
+The measured tokenizer had SHA-256 `8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6`.
 
-| Parser state | Allowed IDs | Individual byte attempts | Trie byte attempts | Individual µs | Trie µs |
+The benchmark compiles [the tool call schema](examples/tool-call.schema.json), then tests five prefixes. It times the original per-token reference, exact byte trie, and projected trie in the same release process. All three paths use separate parsers, one untimed warmup per state, and 12 timed passes in balanced order. Each trial compares the complete masks across all 50,257 token IDs. The CSV reports attempted chart transitions and medians using wall-clock `Instant`. Vocabulary builds, prefix setup, and exact equality checks are outside the mask timings. The projected build includes the byte partition. The existing microsecond columns remain available for the reference and exact byte trie.
+
+The [recorded run](evidence/gpt2-byte-projection.csv) used rustc 1.87.0 on arm64 macOS 27.2.1. The exact trie uses the traversal from `4f85196`. Across seven independent release processes and all 420 timed trials, the projected trie and exact trie masks both matched the per-token reference bit for bit. The table takes the median of the seven process medians.
+
+| Parser state | Allowed IDs | Exact trie attempts | Projected trie attempts | Exact trie median (ns) | Projected trie median (ns) |
 |---|---:|---:|---:|---:|---:|
-| Start | 2 | 50,259 | 259 | 338 | 2 |
-| Action enum | 8 | 52,508 | 354 | 518 | 4 |
-| Query text | 50,032 | 320,705 | 97,929 | 312,983 | 105,414 |
-| Unicode escape | 1 | 50,271 | 264 | 388 | 3 |
-| Complete | 1 | 50,256 | 256 | 382 | 2 |
+| Start | 2 | 259 | 53 | 1,708 | 1,021 |
+| Action enum | 8 | 354 | 135 | 2,875 | 1,896 |
+| Query text | 50,032 | 97,929 | 80,472 | 45,783,354 | 37,949,271 |
+| Unicode escape | 1 | 264 | 54 | 1,645 | 896 |
+| Complete | 1 | 256 | 50 | 1,208 | 791 |
 
-The free-form string state still visits most of the trie. The measurements show where prefix sharing helps and where additional mask caching or a different parser representation would matter. This benchmark uses a real tokenizer vocabulary with predetermined parser states. The two decoding examples still use fixture logits.
+For query text, the per-process medians ranged from 43.81 to 49.23 ms for the exact trie and from 35.60 to 39.72 ms for the projected trie. The benchmark built the exact trie first and the projected trie second. They had 98,024 and 80,538 nodes respectively, with median build times of 11.11 and 7.07 ms. The smallest timings are sensitive to timer overhead. These measurements cover mask generation on one host with fixed schema prefixes. The [earlier run](evidence/gpt2-earley-before-after.csv) measured the chart indexing changes separately.
 
 ## Model integration
 
@@ -62,7 +70,7 @@ Pass a `serde_json::Value` to `json_schema::compile`, or use `Grammar::new` to s
 cargo test --locked
 ```
 
-The tests exercise the public parser, decoder, and schema compiler, then run all three CLI modes. The mask benchmark uses an offline fixture with 50,257 token IDs and checks that the two algorithms agree. The real GPT-2 performance experiment above is separate.
+The tests cover overlapping terminal byte sets, duplicate token IDs, split UTF-8, foreign grammar reuse, all 256 distinct byte classes, and the public decoding paths. An offline fixture with 50,257 IDs exercises the benchmark CLI and checks exact agreement across all three paths.
 
 On macOS, use Rust's source-based instrumentation and Xcode's LLVM tools:
 
@@ -79,4 +87,4 @@ xcrun llvm-cov report "$cov_dir/build/debug/grammar-decoder" \
   src/lib.rs src/json_schema.rs src/json_schema/syntax.rs src/main.rs src/mask_benchmark.rs
 ```
 
-Ten tests covered 798 of 808 production lines (98.76%) and 627 of 652 regions (96.17%). Stable Rust emitted no branch counters for this build. The remaining lines handle compiler invariants, errors from serializing in-memory JSON, and failures of the bundled demo and benchmark checks.
+Fourteen tests covered 921 of 931 production lines (98.93%) and 678 of 705 regions (96.17%). Stable Rust emitted no branch counters for this build. The remaining lines handle compiler invariants, errors from serializing in-memory JSON, and failures of the bundled demo and benchmark checks.
