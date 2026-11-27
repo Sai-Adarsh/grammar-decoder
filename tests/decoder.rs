@@ -184,6 +184,45 @@ fn decoder_runs_dense_and_sparse_paths_without_emitting_illegal_tokens() {
 }
 
 #[test]
+fn sampler_returns_a_legal_token_when_upper_endpoint_rounding_exhausts_the_weights() {
+    struct NearEndpoint(bool);
+
+    impl LogitSource for NearEndpoint {
+        fn logits(&mut self, output: &mut [f64]) {
+            if self.0 {
+                output[4] = 0.0;
+            } else {
+                output[..4].copy_from_slice(&[0.0, -3.5, -3.5, -3.5]);
+            }
+        }
+
+        fn accept(&mut self, _: usize) {
+            self.0 = true;
+        }
+    }
+
+    let grammar = Grammar::new(
+        0,
+        vec![(0, vec![Symbol::Byte(ByteSet::ranges(&[(b'a', b'd')]))])],
+    )
+    .unwrap();
+    let tokens = [vec![b'a'], vec![b'b'], vec![b'c'], vec![b'd'], vec![]];
+    let output = decode(
+        &grammar,
+        &tokens,
+        &mut NearEndpoint(false),
+        DecodeOptions {
+            // The first uniform draw is the largest representable draw below one.
+            seed: 0x3162_8af6_7b21_31ab,
+            ..options(4, 1, 1.0)
+        },
+    )
+    .unwrap();
+    assert_eq!(output.token_ids, [0]);
+    assert_eq!(output.bytes, b"a");
+}
+
+#[test]
 fn schema_covers_closed_objects_arrays_numbers_unicode_and_literal_types() {
     let grammar = compile(&json!({
         "$schema":"https://json-schema.org/draft/2020-12/schema",
@@ -260,9 +299,23 @@ fn unsupported_schemas_report_the_constraint_and_preflight_limits() {
         (json!({"$schema":"old","type":"string"}), "/$schema"),
         (json!({"type":["string","null"]}), "/type"),
         (json!({"type":"integer","minimum":0}), "/minimum"),
+        (
+            json!({"type":"array","items":{"type":"string"},"minItems":1}),
+            "/minItems",
+        ),
+        (
+            json!({"type":"array","items":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"string"}}),
+            "/items/$schema",
+        ),
+        (
+            json!({"type":"object","additionalProperties":false,"maxProperties":1}),
+            "/maxProperties",
+        ),
         (json!({"type":"string","title":42}), "/title"),
         (json!({}), "expected type"),
+        (json!({"properties":{}}), "/properties"),
         (json!({"const":1,"enum":[2]}), "choose either"),
+        (json!({"const":"hi","minLength":1}), "/minLength"),
         (json!({"enum":[]}), "/enum"),
         (json!({"enum":1}), "/enum"),
         (json!({"const":[1.1]}), "integer notation"),
@@ -298,6 +351,10 @@ fn unsupported_schemas_report_the_constraint_and_preflight_limits() {
         (json!({"const":wide}), "JSON values"),
         (
             json!({"const":"x".repeat(8 * 1024)}),
+            "bytes of keys and strings",
+        ),
+        (
+            json!({"const":{"a".repeat(8 * 1024):null}}),
             "bytes of keys and strings",
         ),
     ];

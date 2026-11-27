@@ -79,4 +79,4 @@ xcrun llvm-cov report "$cov_dir/build/debug/grammar-decoder" \
   src/lib.rs src/json_schema.rs src/json_schema/syntax.rs src/main.rs src/mask_benchmark.rs
 ```
 
-Nine tests covered 797 of 808 production lines (98.64%) and 619 of 652 regions (94.94%). Stable Rust emitted no branch counters for this build. The remaining lines include internal invariant failures and a floating-point sampling fallback.
+Ten tests covered 798 of 808 production lines (98.76%) and 627 of 652 regions (96.17%). Stable Rust emitted no branch counters for this build. The remaining lines handle compiler invariants, errors from serializing in-memory JSON, and failures of the bundled demo and benchmark checks.

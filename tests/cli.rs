@@ -85,6 +85,10 @@ fn schema_cli_rejects_partial_or_oversized_documents() {
         "candidate rejected at byte 0",
     );
     failure(
+        cli(&["--schema", path.to_str().unwrap()], b"-"),
+        "candidate rejected at byte 1",
+    );
+    failure(
         cli(
             &["--schema", path.to_str().unwrap()],
             &[b' '; 16 * 1024 + 1],
@@ -100,6 +104,11 @@ fn schema_cli_rejects_partial_or_oversized_documents() {
     failure(
         cli(&["--schema", malformed.to_str().unwrap()], b""),
         "expected ident",
+    );
+    let unsupported = work.write("unsupported.json", br#"{"type":"integer","minimum":0}"#);
+    failure(
+        cli(&["--schema", unsupported.to_str().unwrap()], b"1"),
+        "/minimum",
     );
 }
 
