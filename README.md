@@ -55,3 +55,28 @@ The free-form string state still visits most of the trie. The measurements show 
 Implement `LogitSource` for next-token scores and model state updates. Pass a vocabulary indexed by token ID and identify the end-of-sequence token. For tokenizers with context-dependent detokenization, adapt piece-to-byte decoding before passing it to the parser.
 
 Pass a `serde_json::Value` to `json_schema::compile`, or use `Grammar::new` to supply another context-free grammar. Validate application-specific rules separately.
+
+## Tests and coverage
+
+```sh
+cargo test --locked
+```
+
+The tests exercise the public parser, decoder, and schema compiler, then run all three CLI modes. The mask benchmark uses an offline fixture with 50,257 token IDs and checks that the two algorithms agree. The real GPT-2 performance experiment above is separate.
+
+On macOS, use Rust's source-based instrumentation and Xcode's LLVM tools:
+
+```sh
+cov_dir=$(mktemp -d)
+mkdir "$cov_dir/raw"
+CARGO_TARGET_DIR="$cov_dir/build" RUSTFLAGS="-Cinstrument-coverage" \
+  LLVM_PROFILE_FILE="$cov_dir/raw/%m-%p.profraw" cargo test --locked
+xcrun llvm-profdata merge -sparse "$cov_dir"/raw/*.profraw -o "$cov_dir/merged.profdata"
+decoder_tests=$(find "$cov_dir/build/debug/deps" -type f -name 'decoder-*' -perm -111)
+cli_tests=$(find "$cov_dir/build/debug/deps" -type f -name 'cli-*' -perm -111)
+xcrun llvm-cov report "$cov_dir/build/debug/grammar-decoder" \
+  -object "$decoder_tests" -object "$cli_tests" -instr-profile "$cov_dir/merged.profdata" \
+  src/lib.rs src/json_schema.rs src/json_schema/syntax.rs src/main.rs src/mask_benchmark.rs
+```
+
+Nine tests covered 797 of 808 production lines (98.64%) and 619 of 652 regions (94.94%). Stable Rust emitted no branch counters for this build. The remaining lines include internal invariant failures and a floating-point sampling fallback.
